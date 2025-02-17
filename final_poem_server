@@ -1,0 +1,416 @@
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdbool.h>
+#include <malloc.h>
+#include <ctype.h>
+#include <fcntl.h>
+
+
+#define MAX_AMOUNT_OF_EXTENSIONS 2000
+// Unix does not limit length of the extension
+#define MAX_EXTENSION_SIZE 120
+
+#define LOKAL_PORT 80
+#define BAK_LOGG 10 // Size of queue pending requests
+
+static void createChildKillParent();
+
+static void daemonizeThisProcess();
+
+static void changeDirToWWW();
+
+char *** readFile(FILE *file, int *extension_array_length);
+
+bool hasExtension(int array_length, char ***extension_array, const char *extension,  char **mimetype);
+bool isPrefix(const char *pre, const char *str);
+
+
+
+static void createChildKillParent(){
+    pid_t pid = fork();
+
+    // Fork returns -1 for error
+    if (pid == -1)
+        exit(EXIT_FAILURE);
+
+    //Exits the parent process
+    if (pid > 0)
+        exit(EXIT_SUCCESS);
+}
+
+static void daemonizeThisProcess(){
+    // Fork is executed and origin makes exit - to achieve that the server is running in the background
+    // Makes it not the process group leader (required for next step)
+    createChildKillParent();
+
+    /* Setsid means that the process becomes the session leader and process group leader for a new session, and
+     * thus becomes free from a possible control terminal.
+    setsid()  creates a new session if the calling process is not a process group leader.  The calling process is
+     the leader  of  the  new  session
+    (i.e., its session ID is made the same as its process ID).  The calling process also becomes the process group
+     leader of a new process group in
+    the session (i.e., its process group ID is made the same as its process ID). */
+
+    if (setsid() == -1)
+        exit(EXIT_FAILURE);
+
+    // Fork is executed and origin makes exit - to prevent the server from being a session leader and thus not being
+    // able to attach a (free) control terminal
+    createChildKillParent();
+}
+
+
+
+const char *getFileType(const char *fileName)
+{
+    const char *txtFile = strrchr(fileName, '.');
+    if (!txtFile || txtFile == fileName)
+        return "";
+    return txtFile + 1;
+}
+
+
+int readAsis(int sd, char *fileName, int array_length, char ***extension_array)
+{
+    FILE *file;
+
+    const char *fileType = getFileType(fileName);
+
+    fprintf(stderr, "fileType is %s\n", fileType);
+
+    //Checking for asis file extension
+    if (strlen(fileName) == 0)
+    {
+        fprintf(stderr, "Bad request\n");
+        printf("%s", "HTTP/1.1 400 Bad Request\r\n\r\n");
+        exit(0);
+    }
+
+    char * mimetype="";
+    bool isValidExtension = hasExtension(array_length,extension_array,fileType,&mimetype);
+    if (isValidExtension == false && strcmp(fileType, "asis") != 0){
+        fprintf(stderr, "Not valid extension\n");
+        printf("%s", "HTTP/1.1 415 Unsupported Media Type.\r\n\r\n");
+        exit(0);
+    }
+
+    fprintf(stderr, "Valid extension\n");
+    fprintf(stderr, "extension: [%s]  mime: [%s]\n", fileType, mimetype);
+
+    file = fopen(fileName, "rb");
+
+    if (file == NULL)
+    {
+        // Handle error (path doesnt exist)
+        printf("%s", "HTTP/1.1 404 Not Found\r\n\r\n");
+        exit(0);
+    }
+    if (strcmp(fileType, "asis") != 0){
+        struct stat st;
+        stat(fileName, &st);
+
+        printf("HTTP/1.1 200 OK\n");
+
+        printf("content-type: %s\n",mimetype);
+        printf("content-length: %ld\n", st.st_size);
+        printf("\r\n");
+    }
+    if (isPrefix("image/",mimetype)){
+        // for images use binary
+        fflush(stdout);
+        char buff[1024];
+        while (fread(buff, sizeof (buff),1,file) > 0) {
+            send(sd, buff, 1024,0);
+        }
+    }else{
+        // txt output
+        char charValue;
+        charValue = fgetc(file);
+        while (charValue != EOF)
+        {
+            printf("%c", charValue);
+            charValue = fgetc(file);
+        }
+    }
+
+    fclose(file);
+    return 0;
+}
+
+bool isPrefix(const char *pre, const char *str)
+{
+    return strncmp(pre, str, strlen(pre)) == 0;
+}
+
+
+// THis method handles the http request.
+void httpRequestMethod(int sd, int array_length, char ***extension_array)
+{
+    const int request_buffer_size = 65540;
+    char request[request_buffer_size];
+    /*The  recv(),  recvfrom(),  and recvmsg() calls are used to receive messages from a socket.  They may be used to
+    receive data on both  connec‐
+    tionless  and  connection-oriented  sockets. */
+    // Counts the bytes received and sets a buffer size.
+    int count_bytes_received = recv(sd, request, request_buffer_size - 1, 0);
+
+    if (count_bytes_received < 0)
+    {
+        perror("recv"); // Print error message if buffer is empty.
+        return;
+    }
+
+    char *requestType = strtok(request, " ");
+
+    char *path = strtok(NULL, " ");
+
+    if (strlen(path) >= 1)
+    {
+        fprintf(stderr, "path is %s\n", path);
+        fprintf(stderr, "requestType is %s\n", requestType);
+        readAsis(sd, path, array_length, extension_array);
+    }else{
+        fprintf(stderr, "strlen for path noth larger than 1.\n");
+    }
+}
+
+static void changeDirToWWW() {
+    //calling the chroot process and sets "/var/www/" as the root directory
+    //if error code -1 is returned, the code exits
+
+    chdir("/var/www/.");
+    if(chroot("/var/www/") != 0) {
+        perror("chroot /var/www/");
+        exit(EXIT_FAILURE);
+    }
+}
+
+int privilege(){
+
+    uid_t uid = 1000; //Set user and group to main user
+    gid_t gid = 1000; //Should have separate service user for security
+
+    if (getuid() == 0) { //Check if root
+        setuid(uid); //Set as user
+        setgid(gid);  /* setgid()  sets  the  effective group ID of the calling process.  If the calling process is
+                      privileged (more precisely: has the CAP_SETGID capability
+                      in its user namespace), the real GID and saved set-group-ID areal so set. */
+    }
+
+    if (setuid(0) != -1){ //check possibility to regain root
+        exit(0); //exit if possible
+    }
+}
+
+
+int web_service(int array_length, char ***extension_array){ // Constructed from "Hallo Tjener" supplied by teacher.
+    struct sockaddr_in lok_adr;
+    int sd, ny_sd;
+
+    // Sets up the socket structure
+    sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    // In order for the operating system not to keep the port reserved after the server's death
+    setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+    // Initializing local adress
+    lok_adr.sin_family = AF_INET;
+    lok_adr.sin_port = htons((u_short)LOKAL_PORT);
+    lok_adr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // Connects the socket and local address
+    if (0 == bind(sd, (struct sockaddr *)&lok_adr, sizeof(lok_adr)))
+        fprintf(stderr, "Prosess %d er knyttet til port %d.\n", getpid(), LOKAL_PORT);
+    else{
+        printf("\n%s", "Could not bind");
+        exit(1);
+    }
+
+    // Waiting for connection request.
+    listen(sd, BAK_LOGG);
+    while (1)
+    {
+
+        // Accepts received request.
+        ny_sd = accept(sd, NULL, NULL);
+
+        fprintf(stderr, "New request accepted.\n");
+
+        if (0 == fork())
+        {
+            // Redirects the socket to the default output.
+            dup2(ny_sd, 1);
+
+            httpRequestMethod(ny_sd, array_length, extension_array);
+
+            fflush(stdout);
+
+            // Makes sure to close the socket for writing and reading.
+            // NB! Free up no space in the file descriptor table.
+            shutdown(ny_sd, SHUT_RDWR);
+            exit(0);
+        }
+
+        else
+        {
+            close(ny_sd);
+        }
+    }
+}
+
+/// checks array contains extension
+bool hasExtension(int array_length, char ***extension_array, const char *extension, char **mimetype) {
+    bool isValidExtension = false;
+    int i;
+    for (i = 0; i < array_length; i++) {
+        int value = strcmp(extension, extension_array[i][0]);
+        if (value == 0) {
+            *mimetype = strdup(extension_array[i][1]);
+            isValidExtension = true;
+            break;
+        }
+    }
+    return isValidExtension;
+}
+
+/// Reads in the contents of mime file and returns array of extensions. extension_array_length pointer is populated with
+/// length of array.
+char *** readFile(FILE *file, int *extension_array_length){
+    char * line = NULL;
+    size_t len = 0;
+
+    // Allocate array
+    int i;
+    char ***array = malloc (sizeof (char *) * MAX_AMOUNT_OF_EXTENSIONS * 2);
+    // Check was able to allocate, on error, these functions return NULL
+    if (!array)
+        return NULL;
+
+    // Iterate through array and allocate space for string
+    for (i = 0; i < MAX_AMOUNT_OF_EXTENSIONS; i++) {
+        // The + 1 is to make room for the NUL terminator.
+        // If you want a string of length n, your array has to be of length n + 1;
+        // n spaces for the n characters of the string, and 1 space for the terminator.
+        array[i] = malloc (sizeof (char *) * 2);
+        if (!array[i]) {
+            free (array);
+            return NULL;
+        }
+
+        array[i][0] = malloc (MAX_EXTENSION_SIZE + 1);
+        array[i][1] = malloc (MAX_EXTENSION_SIZE + 1);
+        if (!array[i][0] || !array[i][1]) {
+            free (array);
+            return NULL;
+        }
+    }
+
+    int extensionsFound = 0;
+    // Read file line by line until end of file.
+    while ((getline(&line, &len, file) != EOF)) {
+        // Keep tabs on when first tab is found.
+        // Do not append to bufferFileExtension until tab is found since tab is always found before extensions.
+        bool has_found_tab = false;
+
+        // Get length of the line so we can iterate it char by char.
+        size_t length = strlen(line);
+
+        // Buffer for current extension yet to be added to list.
+        char bufferFileExtension[MAX_EXTENSION_SIZE];
+        memset(bufferFileExtension, 0, sizeof bufferFileExtension);
+        int bufferIndexFileExtension = 0;
+
+        char bufferFileMimeContent[MAX_EXTENSION_SIZE];
+        memset(bufferFileMimeContent, 0, sizeof bufferFileMimeContent);
+        int bufferIndexMimeContent = 0;
+
+        char fileMime[MAX_EXTENSION_SIZE];
+
+        size_t k = 0;
+        // Iterate character by character until length of line.
+        for (; k < length; k++) {
+            // Tab means we can start appending to bufferFileExtension.
+            if (line[k] == '\t')
+            {
+                if (bufferIndexMimeContent > 0){
+                    strncpy(fileMime,bufferFileMimeContent, MAX_EXTENSION_SIZE);
+                }
+                has_found_tab = true;
+            }
+                // either space or new line means that we can copy current bufferFileExtension string as an extension.
+            else if (line[k] == ' ' || line[k] == '\n'){
+                // only copy if found tab and bufferFileExtension is not empty.
+                if (has_found_tab && bufferIndexFileExtension > 0){
+                    strncpy (array[extensionsFound][0], bufferFileExtension, MAX_EXTENSION_SIZE);
+                    strncpy (array[extensionsFound][1], fileMime, MAX_EXTENSION_SIZE);
+                    extensionsFound = extensionsFound + 1;
+                    // clear current bufferFileExtension string.
+                    memset(bufferFileExtension, 0, sizeof bufferFileExtension);
+                    bufferIndexFileExtension = 0;
+                }
+            }else if (has_found_tab){
+                // isalnum returns 0 if char is not alphanumeric
+                // extensions must be alphanumeric
+                if (isalnum(line[k]) == 0){
+                    // invalid character, continue to next character in line.
+                    continue;
+                }
+                // Add char to bufferFileExtension since it is alphanumeric
+                bufferFileExtension[bufferIndexFileExtension] = line[k];
+                bufferIndexFileExtension = bufferIndexFileExtension + 1;
+                if (bufferIndexFileExtension == MAX_EXTENSION_SIZE){
+                    printf("Extension exceeds max extension size!\n");
+                    return NULL;
+                }
+            }else{
+                bufferFileMimeContent[bufferIndexMimeContent] = line[k];
+                bufferIndexMimeContent = bufferIndexMimeContent + 1;
+                if (bufferIndexMimeContent == MAX_EXTENSION_SIZE){
+                    printf("Mime exceeds max extension size!\n");
+                    return NULL;
+                }
+            }
+        }
+    }
+
+//     Change the value of the pointer
+    *extension_array_length = extensionsFound;
+    return array;
+}
+
+int main(){
+
+    int f = open ("/var/log/TEST1.txt", O_CREAT | O_RDWR | O_APPEND, 0644);
+    dup2 (f, STDERR_FILENO);
+
+    //  Signal is made to ignore SIGHUP (which is sent all the processes in a session when the session leader terminates
+    //  in the next step)
+    signal(SIGCHLD,SIG_IGN);
+
+    int array_length = 0;
+    FILE *file = fopen("/etc/mime.types", "r");
+    if (file) {
+        char *** extension_array = readFile(file, &array_length);
+        fclose(file);
+        if (!extension_array) {
+            printf ("Error occurred on readFile!\n");
+            return 1;
+        }
+        daemonizeThisProcess();
+        changeDirToWWW();
+
+        // Starting the web service.
+        web_service(array_length, extension_array);
+
+    }else{
+        printf ("Could not open file!\n");
+        return 1;
+    }
+    return 0;
+}
