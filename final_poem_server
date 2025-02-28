@@ -50,7 +50,7 @@ static void daemonizeThisProcess(){
     createChildKillParent();
 
     /* Setsid means that the process becomes the session leader and process group leader for a new session, and
-     * thus becomes free from a possible control terminal.
+     * thus becomes free from a possible control terminal . 
     setsid()  creates a new session if the calling process is not a process group leader.  The calling process is
      the leader  of  the  new  session
     (i.e., its session ID is made the same as its process ID).  The calling process also becomes the process group
